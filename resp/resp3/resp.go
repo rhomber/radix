@@ -1865,11 +1865,11 @@ func (a Any) UnmarshalRESP(br *bufio.Reader) error {
 		fallthrough
 
 	case SimpleStringPrefix, NumberPrefix, DoublePrefix, BigNumberPrefix:
-		reader := byteReaderPool.Get().(*bytes.Reader)
-		reader.Reset(b)
-		err := a.unmarshalSingle(reader, reader.Len())
-		byteReaderPool.Put(reader)
-		return err
+		//reader := byteReaderPool.Get().(*bytes.Reader)
+		//reader.Reset(b)
+		//defer byteReaderPool.Put(reader)
+		br := bytesutil.ByteReader(b)
+		return a.unmarshalSingle(&br, len(b))
 
 	default:
 		return fmt.Errorf("unknown type prefix %q", prefix)
