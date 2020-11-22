@@ -105,7 +105,7 @@ func (cfg SentinelConfig) New(ctx context.Context, primaryName string, sentinelA
 
 	pconnCfg := PersistentPubSubConfig{
 		Dialer: Dialer{
-			CustomDialer: func(ctx context.Context, _, _ string) (Conn, error) {
+			CustomConn: func(ctx context.Context, _, _ string) (Conn, error) {
 				return sc.dialSentinel(ctx)
 			},
 		},

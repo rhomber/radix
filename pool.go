@@ -3,7 +3,7 @@ package radix
 import (
 	"context"
 	"errors"
-	"io"
+	"math/rand"
 	"net"
 	"sync/atomic"
 	"time"
@@ -11,44 +11,58 @@ import (
 	"github.com/mediocregopher/radix/v4/internal/proc"
 	"github.com/mediocregopher/radix/v4/resp"
 	"github.com/mediocregopher/radix/v4/trace"
+	"github.com/tilinna/clock"
 )
 
 var errPoolFull = errors.New("connection pool is full")
 
-// ioErrConn is a Conn which tracks the last net.Error which was seen either
+// poolConn is a Conn which tracks the last net.Error which was seen either
 // during an Encode call or a Decode call
-type ioErrConn struct {
+type poolConn struct {
 	Conn
 
-	// The most recent network error which occurred when either reading
-	// or writing. A critical network error is basically any non-application
-	// level error, e.g. a timeout, disconnect, etc... Close is automatically
-	// called on the client when it encounters a critical network error
-	lastIOErr error
+	// A channel to which critical network errors are written. A critical
+	// network error is basically any non-application level error, e.g. a
+	// timeout, disconnect, etc...
+	lastIOErrCh chan error
 }
 
-func newIOErrConn(c Conn) *ioErrConn {
-	return &ioErrConn{Conn: c}
-}
-
-func (ioc *ioErrConn) EncodeDecode(ctx context.Context, m, u interface{}) error {
-	if ioc.lastIOErr != nil {
-		return ioc.lastIOErr
+func newPoolConn(c Conn) *poolConn {
+	return &poolConn{
+		Conn:        c,
+		lastIOErrCh: make(chan error, 1),
 	}
-	err := ioc.Conn.EncodeDecode(ctx, m, u)
+}
+
+func (pc *poolConn) EncodeDecode(ctx context.Context, m, u interface{}) error {
+	err := pc.Conn.EncodeDecode(ctx, m, u)
 	if err != nil && !errors.As(err, new(resp.ErrConnUsable)) {
-		ioc.lastIOErr = err
+		select {
+		case pc.lastIOErrCh <- err:
+		default:
+		}
 	}
 	return err
 }
 
-func (ioc *ioErrConn) Do(ctx context.Context, a Action) error {
-	return a.Perform(ctx, ioc)
+func (pc *poolConn) Do(ctx context.Context, a Action) error {
+	return a.Perform(ctx, pc)
 }
 
-func (ioc *ioErrConn) Close() error {
-	ioc.lastIOErr = io.EOF
-	return ioc.Conn.Close()
+func (pc *poolConn) Close() error {
+	return pc.Conn.Close()
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+type bwFlushCallback struct {
+	resp.BufferedWriter
+	cb func()
+}
+
+func (bw bwFlushCallback) Flush() error {
+	bw.cb()
+	return bw.BufferedWriter.Flush()
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -93,49 +107,6 @@ type PoolConfig struct {
 	// Defaults to 1 second.
 	RefillInterval time.Duration
 
-	// OnEmptyCreateImmediately effects the Pool's behavior when there are no
-	// available connections in the Pool. The effect is to cause a new Conn to
-	// be created immediately and used.
-	//
-	// OnEmptyCreateImmediately is mutually exclusive with OnEmptyCreateAfter.
-	OnEmptyCreateImmediately bool
-
-	// OnEmptyCreateAfter effects the Pool's behavior when there are no
-	// available connections in the Pool. The effect is to cause actions to
-	// block until a Conn becomes available or until the duration has passed. If
-	// the duration is passed a new connection is created and used.
-	//
-	// If -1 then the Pool will block indefinitely (or until the passed in
-	// Context is cancelled).
-	//
-	// Defaults to 1 second.
-	OnEmptyCreateAfter time.Duration
-
-	// OverflowBufferSize indicates how big the overflow buffer should be. The
-	// overflow buffer is used when a Conn is being put back into a full Pool;
-	// the Conn will instead be put into the buffer, making it available for
-	// use. If the overflow buffer is full then the Conn is closed.
-	//
-	// See OverflowBufferDrainInterval for details on how the overflow is
-	// drained.
-	//
-	// If OnEmptyCreateAfter is -1 this won't have any effect, because there
-	// won't be any occasion where more connections than the pool size will be
-	// created.
-	//
-	// If -1 then no overflow buffer will be used.
-	//
-	// If not given the default value is calculated to be roughly 1/3 of the
-	// size of the Pool.
-	OverflowBufferSize int
-
-	// OverflowBufferDrainInterval indicates the interval at which a drain event
-	// happens. On each drain event a Conn will be removed from the overflow
-	// buffer (if any are present in it), closed, and discarded.
-	//
-	// Defaults to 1 second.
-	OverflowBufferDrainInterval time.Duration
-
 	// Trace contains callbacks that a Pool can use to trace itself.
 	//
 	// All callbacks are blocking.
@@ -145,6 +116,11 @@ type PoolConfig struct {
 	// be written to. If the channel blocks the error will be dropped. The
 	// channel will be closed when the Pool is closed.
 	ErrCh chan<- error
+
+	// Clock is used for time operations and is primarily useful for testing.
+	//
+	// Defaults to clock.Realtime().
+	Clock clock.Clock
 }
 
 func (cfg PoolConfig) withDefaults() PoolConfig {
@@ -159,19 +135,11 @@ func (cfg PoolConfig) withDefaults() PoolConfig {
 	if cfg.RefillInterval == 0 {
 		cfg.RefillInterval = 1 * time.Second
 	}
-	if cfg.OnEmptyCreateAfter == -1 {
-		cfg.OnEmptyCreateAfter = 0
-	} else if cfg.OnEmptyCreateAfter == 0 {
-		cfg.OnEmptyCreateAfter = 1 * time.Second
+	if cfg.Clock == nil {
+		cfg.Clock = clock.Realtime()
 	}
-	if cfg.OverflowBufferSize == -1 {
-		cfg.OverflowBufferSize = 0
-	} else if cfg.OverflowBufferSize == 0 {
-		cfg.OverflowBufferSize = (cfg.Size / 3) + 1
-	}
-	if cfg.OverflowBufferDrainInterval == 0 {
-		cfg.OverflowBufferDrainInterval = 1 * time.Second
-	}
+
+	cfg.Dialer = cfg.Dialer.withDefaults()
 	return cfg
 }
 
@@ -197,7 +165,8 @@ type Pool struct {
 	proc          *proc.Proc
 	cfg           PoolConfig
 	network, addr string
-	pool          chan *ioErrConn
+	pool          []*poolConn
+	notifyCh      chan struct{}
 }
 
 var _ Client = new(Pool)
@@ -213,42 +182,42 @@ func (cfg PoolConfig) NewClient(ctx context.Context, network, addr string) (Clie
 }
 
 // New initializes and returns a Pool instance using the PoolConfig. This will
-// panic if CustomPool is set in the PoolConfig.
+// panic if CustomPool is set in the PoolConfig, use NewClient instead.
 func (cfg PoolConfig) New(ctx context.Context, network, addr string) (*Pool, error) {
 	if cfg.CustomPool != nil {
-		panic("Cannot use PoolConfig.New with CustomPool")
+		panic("Cannot use PoolConfig.New with PoolConfig.CustomPool")
 	}
 
+	cfg = cfg.withDefaults()
 	p := &Pool{
-		proc:    proc.New(),
-		cfg:     cfg.withDefaults(),
-		network: network,
-		addr:    addr,
+		proc:     proc.New(),
+		cfg:      cfg,
+		network:  network,
+		addr:     addr,
+		pool:     make([]*poolConn, 0, cfg.Size),
+		notifyCh: make(chan struct{}, 1),
 	}
-
-	totalSize := p.cfg.Size + p.cfg.OverflowBufferSize
-	p.pool = make(chan *ioErrConn, totalSize)
 
 	// make one Conn synchronously to ensure there's actually a redis instance
 	// present. The rest will be created asynchronously.
-	ioc, err := p.newConn(ctx, trace.PoolConnCreatedReasonInitialization)
+	pc, err := p.newConn(ctx, trace.PoolConnCreatedReasonInitialization)
 	if err != nil {
 		return nil, err
 	}
-	p.put(ioc)
+	p.put(pc)
 
 	p.proc.Run(func(ctx context.Context) {
-		startTime := time.Now()
+		startTime := p.cfg.Clock.Now()
 		for i := 0; i < p.cfg.Size-1; i++ {
-			ioc, err := p.newConn(ctx, trace.PoolConnCreatedReasonInitialization)
+			pc, err := p.newConn(ctx, trace.PoolConnCreatedReasonInitialization)
 			if err != nil {
 				p.err(err)
 				// if there was an error connecting to the instance than it
 				// might need a little breathing room, redis can sometimes get
 				// sad if too many connections are created simultaneously.
-				time.Sleep(100 * time.Millisecond)
+				p.cfg.Clock.Sleep(100 * time.Millisecond)
 				continue
-			} else if !p.put(ioc) {
+			} else if !p.put(pc) {
 				// if the connection wasn't put in it could be for two reasons:
 				// - the Pool has already started being used and is full.
 				// - Close was called.
@@ -256,22 +225,20 @@ func (cfg PoolConfig) New(ctx context.Context, network, addr string) (*Pool, err
 				break
 			}
 		}
-		p.traceInitCompleted(time.Since(startTime))
+		p.traceInitCompleted(p.cfg.Clock.Since(startTime))
 
 	})
 
 	if p.cfg.PingInterval > 0 && p.cfg.Size > 0 {
 		p.atIntervalDo(p.cfg.PingInterval, func(ctx context.Context) {
-			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			ctx, cancel := p.cfg.Clock.TimeoutContext(ctx, 5*time.Second)
 			defer cancel()
+			// TODO this needs to manually retrieve a connection from the pool.
 			p.Do(ctx, Cmd(nil, "PING"))
 		})
 	}
 	if p.cfg.RefillInterval > 0 && p.cfg.Size > 0 {
 		p.atIntervalDo(p.cfg.RefillInterval, p.doRefill)
-	}
-	if p.cfg.OverflowBufferSize > 0 && p.cfg.OverflowBufferDrainInterval > 0 {
-		p.atIntervalDo(p.cfg.OverflowBufferDrainInterval, p.doOverflowDrain)
 	}
 	return p, nil
 }
@@ -295,7 +262,7 @@ func (p *Pool) err(err error) {
 func (p *Pool) traceCommon() trace.PoolCommon {
 	return trace.PoolCommon{
 		Network: p.network, Addr: p.addr,
-		PoolSize: p.cfg.Size, OverflowBufferSize: p.cfg.OverflowBufferSize,
+		PoolSize:   p.cfg.Size,
 		AvailCount: len(p.pool),
 	}
 }
@@ -326,22 +293,22 @@ func (p *Pool) traceConnClosed(reason trace.PoolConnClosedReason) {
 	}
 }
 
-func (p *Pool) newConn(ctx context.Context, reason trace.PoolConnCreatedReason) (*ioErrConn, error) {
-	start := time.Now()
+func (p *Pool) newConn(ctx context.Context, reason trace.PoolConnCreatedReason) (*poolConn, error) {
+	start := p.cfg.Clock.Now()
 	c, err := p.cfg.Dialer.Dial(ctx, p.network, p.addr)
-	elapsed := time.Since(start)
+	elapsed := p.cfg.Clock.Since(start)
 	p.traceConnCreated(ctx, elapsed, reason, err)
 	if err != nil {
 		return nil, err
 	}
-	ioc := newIOErrConn(c)
+	pc := newPoolConn(c)
 	atomic.AddInt64(&p.totalConns, 1)
-	return ioc, nil
+	return pc, nil
 }
 
 func (p *Pool) atIntervalDo(d time.Duration, do func(context.Context)) {
 	p.proc.Run(func(ctx context.Context) {
-		t := time.NewTicker(d)
+		t := p.cfg.Clock.NewTicker(d)
 		defer t.Stop()
 		for {
 			select {
@@ -359,116 +326,99 @@ func (p *Pool) doRefill(ctx context.Context) {
 	if atomic.LoadInt64(&p.totalConns) >= int64(p.cfg.Size) {
 		return
 	}
-	ioc, err := p.newConn(ctx, trace.PoolConnCreatedReasonRefill)
+	pc, err := p.newConn(ctx, trace.PoolConnCreatedReasonRefill)
 	if err == nil {
-		p.put(ioc)
+		p.putConn(pc)
 	} else if err != errPoolFull {
 		p.err(err)
 	}
 }
 
-func (p *Pool) doOverflowDrain(context.Context) {
-	if len(p.pool) <= p.cfg.Size {
-		return
-	}
+func (p *Pool) getConn(ctx context.Context) (*poolConn, error) {
+	for {
+		var pc *poolConn
+		err := p.proc.WithLock(func() error {
+			if len(p.pool) == 0 {
+				return nil
+			}
 
-	// pop a connection off and close it, if there's any to pop off
-	var ioc *ioErrConn
-	select {
-	case ioc = <-p.pool:
-	default:
-		// pool is empty, nothing to drain
-		return
-	}
-
-	ioc.Close()
-	p.traceConnClosed(trace.PoolConnClosedReasonBufferDrain)
-	atomic.AddInt64(&p.totalConns, -1)
-}
-
-func (p *Pool) getExisting(ctx context.Context) (*ioErrConn, error) {
-	// Fast-path if the pool is not empty. Return error if pool has been closed.
-	select {
-	case ioc, ok := <-p.pool:
-		if !ok {
-			return nil, proc.ErrClosed
+			i := len(p.pool) - 1
+			pc, p.pool = p.pool[i], p.pool[:i]
+			return nil
+		})
+		if err != nil || pc != nil {
+			return pc, err
 		}
-		return ioc, nil
-	default:
-	}
 
-	if p.cfg.OnEmptyCreateImmediately {
-		return nil, nil
-	}
-
-	// only set when we have a timeout, since a nil channel always blocks which
-	// is what we want
-	var tc <-chan time.Time
-	if p.cfg.OnEmptyCreateAfter > 0 {
-		tc = time.After(p.cfg.OnEmptyCreateAfter)
-	}
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case ioc, ok := <-p.pool:
-		if !ok {
-			return nil, proc.ErrClosed
+		select {
+		case <-p.notifyCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		return ioc, nil
-	case <-tc:
-		return nil, nil
 	}
-}
-
-func (p *Pool) get(ctx context.Context) (*ioErrConn, error) {
-	ioc, err := p.getExisting(ctx)
-	if err != nil {
-		return nil, err
-	} else if ioc != nil {
-		return ioc, nil
-	}
-	return p.newConn(ctx, trace.PoolConnCreatedReasonPoolEmpty)
 }
 
 // returns true if the connection was put back, false if it was closed and
 // discarded.
-func (p *Pool) put(ioc *ioErrConn) bool {
-	if ioc.lastIOErr == nil {
-		var ok bool
-		_ = p.proc.WithRLock(func() error {
-			select {
-			case p.pool <- ioc:
-				ok = true
-			default:
-			}
-			return nil
-		})
-		if ok {
-			return true
-		}
+func (p *Pool) putConn(pc *poolConn) bool {
+	select {
+	case <-pc.lastIOErrCh:
+		pc.Close()
+		p.traceConnClosed(trace.PoolConnClosedReasonError)
+		atomic.AddInt64(&p.totalConns, -1)
+		return false
+	default:
 	}
 
-	// the pool might close here, but that's fine, because all that's happening
-	// at this point is that the connection is being closed
-	ioc.Close()
-	p.traceConnClosed(trace.PoolConnClosedReasonPoolFull)
-	atomic.AddInt64(&p.totalConns, -1)
-	return false
+	err := p.proc.WithLock(func() error {
+		p.pool = append(p.pool, pc)
+		select {
+		case p.notifyCh <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	return err == nil
+}
+
+func (p *Pool) useConn(ctx context.Context, a Action) error {
+	for {
+		var ok bool
+		err := p.proc.WithRLock(func() error {
+			if len(p.pool) == 0 {
+				return nil
+			}
+			ok = true
+			pc := p.pool[rand.Intn(len(p.pool))]
+			return pc.Do(ctx, a)
+		})
+		if ok || err != nil {
+			return err
+		}
+
+		select {
+		case <-p.notifyCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Do implements the Do method of the Client interface by retrieving a Conn out
 // of the pool, calling Perform on the given Action with it, and returning the
 // Conn to the pool.
 func (p *Pool) Do(ctx context.Context, a Action) error {
-	c, err := p.get(ctx)
+	if a.Properties().CanShareConn {
+		return p.useConn(ctx, a)
+	}
+
+	pc, err := p.getConn(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = c.Do(ctx, a)
-	p.put(c)
-
+	err = pc.Do(ctx, a)
+	p.putConn(pc)
 	return err
 }
 
@@ -476,19 +426,6 @@ func (p *Pool) Do(ctx context.Context, a Action) error {
 // pool, as well as in the overflow buffer if that option is enabled.
 func (p *Pool) NumAvailConns() int {
 	return len(p.pool)
-}
-
-func (p *Pool) drain() {
-	for {
-		select {
-		case ioc := <-p.pool:
-			ioc.Close()
-			atomic.AddInt64(&p.totalConns, -1)
-			p.traceConnClosed(trace.PoolConnClosedReasonPoolClosed)
-		default:
-			return
-		}
-	}
 }
 
 // Addr implements the method for the Client interface.
@@ -499,8 +436,11 @@ func (p *Pool) Addr() net.Addr {
 // Close implements the method for the Client interface.
 func (p *Pool) Close() error {
 	return p.proc.Close(func() error {
-		p.drain()
-		close(p.pool)
+		for _, pc := range p.pool {
+			pc.Close()
+			atomic.AddInt64(&p.totalConns, -1)
+			p.traceConnClosed(trace.PoolConnClosedReasonPoolClosed)
+		}
 		if p.cfg.ErrCh != nil {
 			close(p.cfg.ErrCh)
 		}

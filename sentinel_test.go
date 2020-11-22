@@ -155,7 +155,7 @@ func TestSentinel(t *T) {
 				return clientWrapAddr{Client: c, addr: rawAddr{network, addr}}, err
 			},
 		},
-		SentinelDialer: Dialer{CustomDialer: stub.newConn},
+		SentinelDialer: Dialer{CustomConn: stub.newConn},
 	}
 	scc, err := cfg.New(ctx, "stub", stub.sentAddrs)
 	require.Nil(t, err)
@@ -247,7 +247,7 @@ func TestSentinelSecondaryRead(t *T) {
 				}), nil
 			},
 		},
-		SentinelDialer: Dialer{CustomDialer: stub.newConn},
+		SentinelDialer: Dialer{CustomConn: stub.newConn},
 	}
 	scc, err := cfg.New(ctx, "stub", stub.sentAddrs)
 	require.Nil(t, err)

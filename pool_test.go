@@ -53,6 +53,7 @@ func TestPool(t *T) {
 	do := func(t *T, cfg PoolConfig) {
 		ctx := testCtx(t)
 		cfg.OverflowBufferSize = -1
+		cfg.Dialer.WriteFlushInterval = -1
 		cfg.Size = 10
 		pool := testPool(t, cfg)
 		var wg sync.WaitGroup
@@ -121,6 +122,7 @@ func TestPoolGet(t *T) {
 		pool := testPool(t, PoolConfig{
 			Size:               1,
 			OnEmptyCreateAfter: -1,
+			Dialer:             Dialer{WriteFlushInterval: -1},
 		})
 		conn, err := pool.get(ctx)
 		assert.NoError(t, err)
@@ -160,6 +162,7 @@ func TestPoolOnFull(t *T) {
 			Trace: trace.PoolTrace{ConnClosed: func(c trace.PoolConnClosed) {
 				reason = c.Reason
 			}},
+			Dialer: Dialer{WriteFlushInterval: -1},
 		})
 		defer pool.Close()
 		assert.Equal(t, 1, len(pool.pool))
@@ -177,6 +180,7 @@ func TestPoolOnFull(t *T) {
 			Size:                        1,
 			OverflowBufferSize:          1,
 			OverflowBufferDrainInterval: 1 * time.Second,
+			Dialer:                      Dialer{WriteFlushInterval: -1},
 		})
 		defer pool.Close()
 		assert.Equal(t, 1, len(pool.pool))
@@ -214,7 +218,8 @@ func TestPoolPut(t *T) {
 	ctx := testCtx(t)
 	size := 10
 	pool := testPool(t, PoolConfig{
-		Size: size,
+		Size:   size,
+		Dialer: Dialer{WriteFlushInterval: -1},
 	})
 
 	assertPoolConns := func(exp int) {
@@ -226,7 +231,7 @@ func TestPoolPut(t *T) {
 	// network error
 	pool.Do(ctx, WithConn("", func(ctx context.Context, conn Conn) error {
 		assertPoolConns(9)
-		conn.(*ioErrConn).lastIOErr = io.EOF
+		conn.(*poolConn).lastIOErr = io.EOF
 		return nil
 	}))
 	assertPoolConns(9)
@@ -236,7 +241,7 @@ func TestPoolPut(t *T) {
 	pool.Do(ctx, WithConn("", func(ctx context.Context, conn Conn) error {
 		var i int
 		assert.NotNil(t, conn.Do(ctx, Cmd(&i, "ECHO", "foo")))
-		assert.Nil(t, conn.(*ioErrConn).lastIOErr)
+		assert.Nil(t, conn.(*poolConn).lastIOErr)
 		return nil
 	}))
 	assertPoolConns(9)
@@ -245,7 +250,7 @@ func TestPoolPut(t *T) {
 	// resp error
 	pool.Do(ctx, WithConn("", func(ctx context.Context, conn Conn) error {
 		assert.NotNil(t, Cmd(nil, "CMDDNE"))
-		assert.Nil(t, conn.(*ioErrConn).lastIOErr)
+		assert.Nil(t, conn.(*poolConn).lastIOErr)
 		return nil
 	}))
 	assertPoolConns(9)
@@ -275,7 +280,7 @@ func TestPoolDoDoesNotBlock(t *T) {
 
 	pool := testPool(t, PoolConfig{
 		Dialer: Dialer{
-			CustomDialer: func(context.Context, string, string) (Conn, error) {
+			CustomConn: func(context.Context, string, string) (Conn, error) {
 				return dial(), nil
 			},
 		},
@@ -301,7 +306,7 @@ func TestPoolDoDoesNotBlock(t *T) {
 			timeStart := time.Now()
 			pool.Do(ctx, WithConn("", func(ctx context.Context, conn Conn) error {
 				time.Sleep(requestTimeout)
-				conn.(*ioErrConn).lastIOErr = errors.New("i/o timeout")
+				conn.(*poolConn).lastIOErr = errors.New("i/o timeout")
 				return nil
 			}))
 
@@ -324,7 +329,7 @@ func TestPoolClose(t *T) {
 	assert.Error(t, proc.ErrClosed, pool.Do(ctx, Cmd(nil, "PING")))
 }
 
-func TestIoErrConn(t *T) {
+func TestPoolConn(t *T) {
 	t.Run("NotReusableAfterError", func(t *T) {
 		ctx := testCtx(t)
 		dummyError := errors.New("i am error")

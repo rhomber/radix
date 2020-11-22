@@ -54,11 +54,11 @@ type ClusterConfig struct {
 	// Cluster will only call NewClient on the PoolConfig, so that custom Client
 	// implementations may be used via CustomPool.
 	//
-	// If PoolConfig.CustomPool and PoolConfig.Dialer.CustomDialer are unset
+	// If PoolConfig.CustomPool and PoolConfig.Dialer.CustomConn are unset
 	// then all Conns created by Cluster will have the READONLY command
 	// performed on them upon creation. For Conns to primary instances this will
 	// have no effect, but for secondaries this will allow DoSecondary to
-	// function properly. If CustomPool or CustomDialer are set then READONLY
+	// function properly. If CustomPool or CustomConn are set then READONLY
 	// must be called on each Conn inside whichever is set in order for
 	// DoSecondary to work.
 	PoolConfig PoolConfig
@@ -105,9 +105,9 @@ func (cfg ClusterConfig) withDefaults() ClusterConfig {
 	}
 
 	if cfg.PoolConfig.CustomPool == nil &&
-		cfg.PoolConfig.Dialer.CustomDialer == nil {
+		cfg.PoolConfig.Dialer.CustomConn == nil {
 		dialer := cfg.PoolConfig.Dialer
-		cfg.PoolConfig.Dialer.CustomDialer = func(ctx context.Context, network, addr string) (Conn, error) {
+		cfg.PoolConfig.Dialer.CustomConn = func(ctx context.Context, network, addr string) (Conn, error) {
 			conn, err := dialer.Dial(ctx, network, addr)
 			if err != nil {
 				return nil, err
