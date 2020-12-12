@@ -9,9 +9,9 @@ import (
 
 	errors "golang.org/x/xerrors"
 
-	"github.com/mediocregopher/radix/v3/resp"
-	"github.com/mediocregopher/radix/v3/resp/resp2"
-	"github.com/mediocregopher/radix/v3/trace"
+	"github.com/rhomber/radix/v3/resp"
+	"github.com/rhomber/radix/v3/resp/resp2"
+	"github.com/rhomber/radix/v3/trace"
 )
 
 // dedupe is used to deduplicate a function invocation, so if multiple
@@ -232,6 +232,23 @@ func assertKeysSlot(keys []string) error {
 		}
 		prevKey = key
 		slot = thisSlot
+	}
+	return nil
+}
+
+func (c *Cluster) assertKeysNode(keys []string) error {
+	var ok bool
+	var prevKey string
+	var node string
+	for _, key := range keys {
+		thisNode := c.addrForKey(key)
+		if !ok {
+			ok = true
+		} else if node != thisNode {
+			return errors.Errorf("keys %q and %q do not belong to the same node", prevKey, key)
+		}
+		prevKey = key
+		node = thisNode
 	}
 	return nil
 }
@@ -521,7 +538,7 @@ func (c *Cluster) Do(a Action) error {
 	keys := a.Keys()
 	if len(keys) == 0 {
 		// that's ok, key will then just be ""
-	} else if err := assertKeysSlot(keys); err != nil {
+	} else if err := c.assertKeysNode(keys); err != nil {
 		return err
 	} else {
 		key = keys[0]
@@ -544,7 +561,7 @@ func (c *Cluster) DoSecondary(a Action) error {
 	keys := a.Keys()
 	if len(keys) == 0 {
 		// that's ok, key will then just be ""
-	} else if err := assertKeysSlot(keys); err != nil {
+	} else if err := c.assertKeysNode(keys); err != nil {
 		return err
 	} else {
 		key = keys[0]

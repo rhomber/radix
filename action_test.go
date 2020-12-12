@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/xerrors"
 
-	"github.com/mediocregopher/radix/v3/resp"
-	"github.com/mediocregopher/radix/v3/resp/resp2"
+	"github.com/rhomber/radix/v3/resp"
+	"github.com/rhomber/radix/v3/resp/resp2"
 )
 
 func TestCmdAction(t *T) {

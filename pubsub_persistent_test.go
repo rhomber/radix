@@ -70,7 +70,7 @@ func TestPersistentPubSubAbortAfter(t *T) {
 	p.Close()
 }
 
-// https://github.com/mediocregopher/radix/issues/184
+// https://github.com/rhomber/radix/issues/184
 func TestPersistentPubSubClose(t *T) {
 	channel := "TestPersistentPubSubClose:" + randStr()
 

@@ -13,8 +13,8 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"github.com/mediocregopher/radix/v3/resp"
-	"github.com/mediocregopher/radix/v3/resp/resp2"
+	"github.com/rhomber/radix/v3/resp"
+	"github.com/rhomber/radix/v3/resp/resp2"
 )
 
 // Action performs a task using a Conn.
