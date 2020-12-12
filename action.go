@@ -385,8 +385,9 @@ func NewEvalScript(numKeys int, script string) EvalScript {
 }
 
 var (
-	evalsha = []byte("EVALSHA")
-	eval    = []byte("EVAL")
+	evalsha    = []byte("EVALSHA")
+	eval       = []byte("EVAL")
+	scriptload = []byte("SCRIPT LOAD")
 )
 
 type evalAction struct {
@@ -398,6 +399,7 @@ type evalAction struct {
 	flatArgs []interface{}
 
 	eval bool
+	load bool
 }
 
 // Cmd is like the top-level Cmd but it uses the the EvalScript to perform an
@@ -450,48 +452,62 @@ func (ec *evalAction) MarshalRESP(w io.Writer) error {
 	}
 
 	var err error
-	if ec.eval {
-		err = marshalBulkStringBytes(err, w, eval)
+	if ec.load {
+		err = marshalBulkStringBytes(err, w, scriptload)
 		err = marshalBulkString(err, w, ec.script)
 	} else {
-		err = marshalBulkStringBytes(err, w, evalsha)
-		err = marshalBulkString(err, w, ec.sum)
-	}
+		if ec.eval {
+			err = marshalBulkStringBytes(err, w, eval)
+			err = marshalBulkString(err, w, ec.script)
+		} else {
+			err = marshalBulkStringBytes(err, w, evalsha)
+			err = marshalBulkString(err, w, ec.sum)
+		}
 
-	err = marshalBulkString(err, w, strconv.Itoa(ec.numKeys))
-	for i := range ec.keys {
-		err = marshalBulkString(err, w, ec.keys[i])
-	}
-	if err != nil {
-		return err
-	}
+		err = marshalBulkString(err, w, strconv.Itoa(ec.numKeys))
+		for i := range ec.keys {
+			err = marshalBulkString(err, w, ec.keys[i])
+		}
+		if err != nil {
+			return err
+		}
 
-	if ec.flat {
-		err = (resp2.Any{
-			I:                     ec.flatArgs,
-			MarshalBulkString:     true,
-			MarshalNoArrayHeaders: true,
-		}).MarshalRESP(w)
-	} else {
-		for i := range ec.args {
-			err = marshalBulkString(err, w, ec.args[i])
+		if ec.flat {
+			err = (resp2.Any{
+				I:                     ec.flatArgs,
+				MarshalBulkString:     true,
+				MarshalNoArrayHeaders: true,
+			}).MarshalRESP(w)
+		} else {
+			for i := range ec.args {
+				err = marshalBulkString(err, w, ec.args[i])
+			}
 		}
 	}
+
 	return err
 }
 
 func (ec *evalAction) Run(conn Conn) error {
-	run := func(eval bool) error {
+	run := func(eval bool, load bool) error {
 		ec.eval = eval
+		ec.load = load
 		if err := conn.Encode(ec); err != nil {
 			return err
 		}
 		return conn.Decode(resp2.Any{I: ec.rcv})
 	}
 
-	err := run(false)
+	err := run(false, false)
 	if err != nil && strings.HasPrefix(err.Error(), "NOSCRIPT") {
-		err = run(true)
+		// load it
+		err = run(false, true)
+		if err != nil {
+			return err
+		}
+
+		// attempt to run again
+		err = run(false, false)
 	}
 	return err
 }
