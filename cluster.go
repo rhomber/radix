@@ -480,6 +480,10 @@ func (c *Cluster) syncEvery(d time.Duration) {
 	}()
 }
 
+func (c *Cluster) AddrForKey(key string) string {
+	return c.addrForKey(key)
+}
+
 func (c *Cluster) addrForKey(key string) string {
 	s := ClusterSlot([]byte(key))
 	c.l.RLock()
